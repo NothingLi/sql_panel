@@ -1,0 +1,12 @@
+{
+  "71064945-d464-4f7d-9d51-5e6011a5dfbf": {
+    "id": "71064945-d464-4f7d-9d51-5e6011a5dfbf",
+    "name": "test",
+    "type": "sqlite",
+    "host": "/Volumes/Ti600/bielai/git projects/sql_panel/test.db",
+    "port": 5432,
+    "user": "",
+    "password": "",
+    "database": "3"
+  }
+}
