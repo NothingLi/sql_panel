@@ -113,6 +113,8 @@ const contextMenu = reactive({
 //const resultViewTab = ref<'table' | 'chart'>('table') // 结果区域当前的显示模式
 const resultViewTab = ref<'table' | 'chart'>('table') // 结果区域当前的显示模式
 const schema = ref<any[]>([])           // 当前连接的表结构信息
+const dbType = ref('')                  // 当前连接的数据库类型（用于函数提示过滤）
+const dbVersion = ref('')               // 当前连接的数据库主版本号（用于函数提示过滤）
 
 // --- 表格增强状态 ---
 const hiddenColumns = ref<Set<string>>(new Set()) // 被隐藏的列
@@ -122,7 +124,8 @@ const sortConfig = reactive({
 })
 
 const globalSettings = reactive({
-  limit: 1000                           // 全局查询行数限制
+  limit: 1000,                           // 全局查询行数限制
+  timeout: 300                           // 查询超时秒数，默认 5 分钟
 })
 const expandedTables = ref<Set<string>>(new Set()) // 记录展开的表名
 const loadingSchema = ref(false)        // 是否正在加载 Schema
@@ -444,7 +447,7 @@ const runQuery = async () => {
     const response = await axios.post('/sqlpanel/api/query', {
       connectionId: currentConnection.value,
       sql: sqlToRun,
-      transactionMode: transactionMode.value,
+      timeout: globalSettings.timeout,
     }, {
       signal: queryAbortController.signal,
     })
@@ -459,11 +462,13 @@ const runQuery = async () => {
       addToHistory(sqlToRun)
     }
   } catch (error: any) {
-    // 请求被主动取消或不显示错误时，保留上一次查询结果
+    // 请求被主动取消时，保留上一次查询结果
     if (error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED') {
       // 不覆盖结果
+    } else {
+      // 将错误详情展示在结果区，方便排查
+      results.value = { error: getRequestErrorMessage(error), duration: 'Query failed' }
     }
-    // 其他错误也不覆盖结果区，由 toast 统一提示
   } finally {
     loading.value = false // 结束加载动画
   }
@@ -476,7 +481,7 @@ const beginTransaction = async () => {
     const response = await axios.post('/sqlpanel/api/query', {
       connectionId: currentConnection.value,
       sql: 'BEGIN',
-      transactionMode: 'begin',
+      timeout: globalSettings.timeout,
     })
     if (response.data.error) {
       results.value = response.data
@@ -498,7 +503,7 @@ const commitTransaction = async () => {
     const response = await axios.post('/sqlpanel/api/query', {
       connectionId: currentConnection.value,
       sql: 'COMMIT',
-      transactionMode: 'commit',
+      timeout: globalSettings.timeout,
     })
     if (response.data.error) {
       results.value = response.data
@@ -520,7 +525,7 @@ const rollbackTransaction = async () => {
     const response = await axios.post('/sqlpanel/api/query', {
       connectionId: currentConnection.value,
       sql: 'ROLLBACK',
-      transactionMode: 'rollback',
+      timeout: globalSettings.timeout,
     })
     if (response.data.error) {
       results.value = response.data
@@ -543,7 +548,7 @@ const {
   MONACO_OPTIONS,
   handleBeforeMount,
   handleMount,
-} = useSqlMonaco(schema, runQuery)
+} = useSqlMonaco(schema, runQuery, dbType, dbVersion)
 
 // 格式化 SQL 代码
 const formatSQL = () => {
@@ -691,7 +696,7 @@ const exportToCSV = async () => {
   try {
     await saveExportLog('CSV', fileName, sortedData.value.length)
   } catch {
-    alert('Failed to save export log. Export cancelled.')
+    showToast('Failed to save export log', 'error')
     return
   }
 
@@ -727,7 +732,7 @@ const exportToExcel = async () => {
   try {
     await saveExportLog('Excel', fileName, sortedData.value.length)
   } catch {
-    alert('Failed to save export log. Export cancelled.')
+    showToast('Failed to save export log', 'error')
     return
   }
 
@@ -740,7 +745,10 @@ const filteredSchema = computed(() => {
 
   return schema.value.filter((table: any) => {
     if (table.name.toLowerCase().includes(term)) return true
-    return table.columns.some((col: string) => col.toLowerCase().includes(term))
+    return table.columns.some((col: any) => {
+      const colName = typeof col === 'string' ? col : col.name
+      return colName.toLowerCase().includes(term)
+    })
   })
 })
 
@@ -748,7 +756,10 @@ watch(schemaSearch, (term) => {
   if (!term.trim()) return
   const t = term.toLowerCase().trim()
   schema.value.forEach((table: any) => {
-    const colMatch = table.columns.some((col: string) => col.toLowerCase().includes(t))
+    const colMatch = table.columns.some((col: any) => {
+      const colName = typeof col === 'string' ? col : col.name
+      return colName.toLowerCase().includes(t)
+    })
     if (colMatch && !table.name.toLowerCase().includes(t)) {
       expandedTables.value.add(table.name)
     }
@@ -763,6 +774,15 @@ const highlightMatch = (text: string): string => {
   return text.replace(regex, '<mark class="schema-highlight">$1</mark>')
 }
 
+/** 规范化列类型显示：统一大写、去除多余空格。 */
+const normalizeColumnType = (col: any): string => {
+  if (typeof col === 'string') {
+    const match = col.match(/^(.+?)\s*\(([^)]+)\)$/)
+    return match ? match[2].trim().toUpperCase() : ''
+  }
+  return (col?.type || '').trim().toUpperCase()
+}
+
 const matchIndex = ref(-1)
 
 const matchCount = computed(() => {
@@ -775,7 +795,7 @@ const matchCount = computed(() => {
     let pos = 0
     while ((pos = name.indexOf(t, pos)) !== -1) { count++; pos++ }
     for (const col of table.columns) {
-      const colName = col.toLowerCase()
+      const colName = (typeof col === 'string' ? col : col.name).toLowerCase()
       pos = 0
       while ((pos = colName.indexOf(t, pos)) !== -1) { count++; pos++ }
     }
@@ -821,17 +841,50 @@ watch(schemaSearch, () => {
   matchIndex.value = -1
 })
 
-// 获取当前连接的 Schema 信息
+// 获取当前连接的 Schema 信息（同时拉取数据库版本用于函数智能提示）
 const fetchSchema = async () => {
-  if (!currentConnection.value) return
+  if (!currentConnection.value) {
+    schema.value = []
+    dbType.value = ''
+    dbVersion.value = ''
+    return
+  }
   loadingSchema.value = true
+  // 同步当前连接类型，供函数提示立即按 dbType 过滤
+  const conn = connections.value.find(c => c.id === currentConnection.value)
+  dbType.value = conn?.type || ''
   try {
-    const response = await axios.get(`/sqlpanel/api/tables/${currentConnection.value}`)
-    schema.value = response.data
+    const [schemaRes, versionRes] = await Promise.all([
+      axios.get(`/sqlpanel/api/tables/${currentConnection.value}`),
+      axios.get(`/sqlpanel/api/connections/${currentConnection.value}/version`),
+    ])
+    // 统一规范化：确保每个列都是 {name, type, comment} 对象格式
+    schema.value = (schemaRes.data || []).map((table: any) => ({
+      ...table,
+      columns: (table.columns || []).map((col: any) => {
+        if (typeof col === 'string') {
+          const match = col.match(/^(.+?)\s*\(([^)]+)\)$/)
+          return {
+            name: match ? match[1].trim() : col,
+            type: match ? match[2].trim().toUpperCase() : '',
+            comment: '',
+          }
+        }
+        return {
+          name: col.name,
+          type: (col.type || '').trim().toUpperCase(),
+          comment: col.comment || '',
+        }
+      }),
+    }))
+    // 后端返回 { type, version }，以版本号为准
+    dbType.value = versionRes.data?.type || dbType.value
+    dbVersion.value = versionRes.data?.version || ''
     expandedTables.value.clear()
   } catch (error) {
     console.error('Failed to fetch schema')
     schema.value = []
+    dbVersion.value = ''
   } finally {
     loadingSchema.value = false
   }
@@ -856,7 +909,7 @@ watch(currentConnection, () => {
 /**
  * 显示右键菜单
  */
-const showContextMenu = (e: MouseEvent, type: 'table' | 'column', tableName: string, colRaw?: string) => {
+const showContextMenu = (e: MouseEvent, type: 'table' | 'column', tableName: string, colName?: string) => {
   e.preventDefault()
   const conn = connections.value.find(c => c.id === currentConnection.value)
   
@@ -867,9 +920,8 @@ const showContextMenu = (e: MouseEvent, type: 'table' | 'column', tableName: str
   contextMenu.tableName = tableName
   contextMenu.dbName = conn?.database_name || 'default'
   
-  if (type === 'column' && colRaw) {
-    // 从 "name (type)" 格式中提取原始列名
-    contextMenu.columnName = colRaw.split(' (')[0]
+  if (type === 'column' && colName) {
+    contextMenu.columnName = colName
   } else {
     contextMenu.columnName = ''
   }
@@ -881,11 +933,10 @@ const showContextMenu = (e: MouseEvent, type: 'table' | 'column', tableName: str
 const copyToClipboard = async (text: string) => {
   try {
     await navigator.clipboard.writeText(text)
-    // 这里可以使用一个更美观的 toast，现在暂时用 alert
-    console.log('Copied:', text)
+    showToast('Copied to clipboard', 'success')
     contextMenu.show = false
   } catch (err) {
-    console.error('Failed to copy:', err)
+    showToast('Failed to copy', 'error')
   }
 }
 
@@ -924,8 +975,7 @@ const insertAllColumnsSQL = (tableName: string) => {
   const table = schema.value.find(t => t.name === tableName)
   if (!table || !table.columns) return
 
-  // 提取原始列名（去掉类型部分）
-  const columnNames = table.columns.map((col: string) => col.split(' (')[0])
+  const columnNames = table.columns.map((col: any) => col.name)
   const columnsStr = columnNames.join(', ')
   
   insertSQL(`SELECT ${columnsStr} FROM ${tableName} LIMIT ${globalSettings.limit};`)
@@ -938,7 +988,7 @@ const insertInsertSQL = (tableName: string) => {
   const table = schema.value.find((t: any) => t.name === tableName)
   if (!table || !table.columns) return
 
-  const columnNames = table.columns.map((col: string) => col.split(' (')[0])
+  const columnNames = table.columns.map((col: any) => col.name)
   const columnsStr = columnNames.join(', ')
   const valuesPlaceholders = columnNames.map(() => "''").join(', ')
 
@@ -1160,11 +1210,13 @@ const handleResizeEnd = () => {
                 
                 <!-- 列信息（展开后显示）：增加右键监听 -->
                 <div v-if="expandedTables.has(table.name)" class="ml-6 space-y-0.5 mt-0.5">
-                  <div v-for="col in table.columns" :key="col" 
-                       @contextmenu="showContextMenu($event, 'column', table.name, col)"
-                       class="flex items-center gap-1.5 p-1 text-[11px] text-slate-500 hover:text-slate-300 transition cursor-default">
+                  <div v-for="col in table.columns" :key="col.name" 
+                       @contextmenu="showContextMenu($event, 'column', table.name, col.name)"
+                       class="flex items-center gap-1.5 p-1 text-[11px] text-slate-500 hover:text-slate-300 transition cursor-default group">
                     <Columns class="w-3 h-3 flex-shrink-0 opacity-50" />
-                    <span class="truncate" v-html="highlightMatch(col)"></span>
+                    <span class="truncate" v-html="highlightMatch(col.name)"></span>
+                    <span class="text-slate-600 flex-shrink-0">({{ normalizeColumnType(col) }})</span>
+                    <span v-if="col.comment" class="text-slate-600 truncate opacity-0 group-hover:opacity-100 transition-opacity ml-1 italic">-- {{ col.comment }}</span>
                   </div>
                 </div>
               </div>
@@ -1308,7 +1360,8 @@ const handleResizeEnd = () => {
   <!-- Custom Context Menu -->
   <div v-if="contextMenu.show" 
        :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
-       class="fixed z-[200] bg-slate-800 border border-slate-700 rounded-lg shadow-2xl py-1 w-48 animate-in fade-in zoom-in duration-100">
+       class="fixed z-[200] bg-slate-800 border border-slate-700 rounded-lg shadow-2xl py-1 w-48 animate-in fade-in zoom-in duration-100"
+       @click.stop>
     
     <!-- Table Context Items -->
     <template v-if="contextMenu.type === 'table'">

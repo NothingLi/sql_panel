@@ -3,16 +3,17 @@
 package main
 
 import (
-		"net/http"
+	"embed"
 	"fmt"
+	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"sql_panel/server/db"
 	"sql_panel/server/handlers"
 	"sql_panel/server/middleware"
-	"embed"
-	"io/fs"
 	"strings"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -31,7 +32,6 @@ func main() {
 
 	// 创建 Gin 引擎
 	r := gin.Default()
-
 
 	distFS, err := fs.Sub(staticFiles, "dist")
 	if err != nil {
@@ -81,8 +81,6 @@ func main() {
 		c.Abort()
 	})
 
-
-
 	panel := r.Group("/sqlpanel")
 	{
 		// 受保护的 API 路由组，需要 JWT 认证
@@ -124,6 +122,9 @@ func main() {
 				// 管理员获取所有连接
 				auth.GET("/connections/all", handlers.GetAllConnections)
 
+				// 探测数据库版本（用于前端函数智能提示按版本过滤）
+				auth.GET("/connections/:id/version", handlers.GetConnectionVersion)
+
 				// 统一查询入口（自动分发 SELECT/INSERT/事务）
 				auth.POST("/query", handlers.ExecuteQuery)
 
@@ -155,7 +156,6 @@ func main() {
 			}
 		}
 	}
-	
 
 	// 从环境变量读取端口，默认 8080
 	port := os.Getenv("PORT")

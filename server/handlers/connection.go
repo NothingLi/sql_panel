@@ -441,3 +441,27 @@ func GetAllConnections(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, list)
 }
+
+// GetConnectionVersion 探测指定连接的数据库版本（主版本号）。
+// 用于前端函数智能提示按版本过滤。结果在连接池中缓存，连接移除时自动失效。
+func GetConnectionVersion(c *gin.Context) {
+	userId := c.MustGet("userId").(int)
+	id := c.Param("id")
+
+	connInfo, err := getConnectionByUserID(userId, id)
+	if err != nil {
+		logError(c, http.StatusNotFound, "Connection not found or permission denied")
+		return
+	}
+
+	version, err := db.Pool.GetVersion(connInfo)
+	if err != nil {
+		logError(c, http.StatusInternalServerError, "Failed to detect database version: "+err.Error())
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"type":    connInfo.Type,
+		"version": version,
+	})
+}

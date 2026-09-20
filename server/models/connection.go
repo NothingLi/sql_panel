@@ -30,4 +30,5 @@ type Connection struct {
 	User         string `json:"user"`         // 数据库用户名
 	Password     string `json:"password"`     // 数据库密码
 	DatabaseName string `json:"database_name"` // 数据库名称
+	Version      string `json:"version,omitempty"` // 数据库版本（运行时探测，不落库）
 }

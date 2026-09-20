@@ -22,6 +22,23 @@ import (
 type QueryRequest struct {
 	SQL          string `json:"sql"`
 	ConnectionId string `json:"connectionId"`
+	Timeout      int    `json:"timeout"` // 超时秒数，0 表示使用默认值
+}
+
+// getQueryTimeout 返回请求指定的超时时间，若未指定则使用全局配置。
+func getQueryTimeout(reqTimeout int) time.Duration {
+	if reqTimeout > 0 {
+		return time.Duration(reqTimeout) * time.Second
+	}
+	return config.QueryTimeout()
+}
+
+// getExecTimeout 返回请求指定的超时时间，若未指定则使用全局配置。
+func getExecTimeout(reqTimeout int) time.Duration {
+	if reqTimeout > 0 {
+		return time.Duration(reqTimeout) * time.Second
+	}
+	return config.ExecTimeout()
 }
 
 // QueryResponse SQL 查询响应体，包含列名和数据行。
@@ -37,6 +54,7 @@ type Row map[string]interface{}
 //   - SELECT/SHOW/DESCRIBE/EXPLAIN → 查询模式，返回列名 + 行数据
 //   - BEGIN/COMMIT/ROLLBACK → 事务控制命令
 //   - INSERT/UPDATE/DELETE 等 → 非查询模式，返回受影响行数
+//
 // 支持在活跃事务中执行。
 func ExecuteQuery(c *gin.Context) {
 	userId := c.MustGet("userId").(int)
@@ -78,8 +96,9 @@ func ExecuteQuery(c *gin.Context) {
 		strings.HasPrefix(upperSQL, "WITH")
 
 	if isQuery {
+		queryTimeout := getQueryTimeout(req.Timeout)
 		if activeTx := db.Pool.GetTx(connInfo.ID, userId); activeTx != nil {
-			executeWithTx(c, activeTx, sqlQuery)
+			executeWithTx(c, activeTx, sqlQuery, queryTimeout)
 			return
 		}
 		dbConn, connErr := db.Pool.GetConnection(connInfo)
@@ -87,7 +106,7 @@ func ExecuteQuery(c *gin.Context) {
 			logError(c, http.StatusInternalServerError, connErr.Error())
 			return
 		}
-		executeQuery(c, dbConn, sqlQuery)
+		executeQuery(c, dbConn, sqlQuery, queryTimeout)
 		return
 	}
 
@@ -98,7 +117,7 @@ func ExecuteQuery(c *gin.Context) {
 
 	execStmts := func() error {
 		hasActiveTx := db.Pool.GetTx(connInfo.ID, userId) != nil
-		ctx, cancel := context.WithTimeout(context.Background(), config.ExecTimeout())
+		ctx, cancel := context.WithTimeout(context.Background(), getExecTimeout(req.Timeout))
 		defer cancel()
 		for _, stmt := range statements {
 			var result sql.Result
@@ -145,7 +164,7 @@ func handleTransactionCommand(c *gin.Context, userId int, connInfo models.Connec
 	case "BEGIN":
 		_, err := db.Pool.BeginTx(connInfo, userId)
 		if err != nil {
-			logError(c, http.StatusInternalServerError, "Failed to begin transaction: " + err.Error())
+			logError(c, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Transaction started", "transactionActive": true})
@@ -165,10 +184,10 @@ func handleTransactionCommand(c *gin.Context, userId int, connInfo models.Connec
 }
 
 // executeQuery 执行 SQL 查询并将结果序列化为 JSON 返回。
-func executeQuery(c *gin.Context, dbConn *sql.DB, sql string) {
+func executeQuery(c *gin.Context, dbConn *sql.DB, sql string, timeout time.Duration) {
 	start := time.Now()
-	
-	ctx, cancel := context.WithTimeout(context.Background(), config.QueryTimeout())
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	rows, err := dbConn.QueryContext(ctx, sql)
@@ -223,10 +242,10 @@ func executeQuery(c *gin.Context, dbConn *sql.DB, sql string) {
 }
 
 // executeWithTx 在活跃事务中执行查询。
-func executeWithTx(c *gin.Context, tx *sql.Tx, sqlStatement string) {
+func executeWithTx(c *gin.Context, tx *sql.Tx, sqlStatement string, timeout time.Duration) {
 	start := time.Now()
-	
-	ctx, cancel := context.WithTimeout(context.Background(), config.QueryTimeout())
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	rows, err := tx.QueryContext(ctx, sqlStatement)
@@ -282,8 +301,15 @@ func executeWithTx(c *gin.Context, tx *sql.Tx, sqlStatement string) {
 
 // TableSchema 返回给前端的表结构信息，包含表名和列列表。
 type TableSchema struct {
-	Name    string   `json:"name"`
-	Columns []string `json:"columns"`
+	Name    string       `json:"name"`
+	Columns []ColumnInfo `json:"columns"`
+}
+
+// ColumnInfo 列信息，包含名称、类型和注释。
+type ColumnInfo struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Comment string `json:"comment"`
 }
 
 // GetTables 获取指定数据库中所有用户表的表名和列信息。
@@ -317,7 +343,7 @@ func GetTables(c *gin.Context) {
 			WHERE table_schema NOT IN ('pg_catalog', 'information_schema') AND table_name NOT LIKE 'pg_%'
 			ORDER BY table_name`
 	default:
-		logError(c, http.StatusNotImplemented, "Not implemented for " + string(connInfo.Type))
+		logError(c, http.StatusNotImplemented, "Not implemented for "+string(connInfo.Type))
 		return
 	}
 
@@ -349,19 +375,21 @@ func GetTables(c *gin.Context) {
 	c.JSON(http.StatusOK, schema)
 }
 
-// getTableColumns 获取指定表的列信息，返回格式如 ["id (INTEGER)", "name (TEXT)"]。
-func getTableColumns(dbConn *sql.DB, dbType models.DBType, tableName string) []string {
-	var colQuery string
+// getTableColumns 获取指定表的列信息，包含列名、类型和注释。
+// tableName 来自系统表查询，非用户直接输入，但仍做转义防止注入。
+func getTableColumns(dbConn *sql.DB, dbType models.DBType, tableName string) []ColumnInfo {
 	switch dbType {
 	case models.SQLite:
-		colQuery = fmt.Sprintf("PRAGMA table_info('%s')", tableName)
+		// PRAGMA 不支持参数化查询，通过转义单引号防止注入
+		safeName := strings.ReplaceAll(tableName, "'", "''")
+		colQuery := fmt.Sprintf("PRAGMA table_info('%s')", safeName)
 		rows, err := dbConn.Query(colQuery)
 		if err != nil {
-			return []string{}
+			return []ColumnInfo{}
 		}
 		defer rows.Close()
 
-		var columns []string
+		var columns []ColumnInfo
 		for rows.Next() {
 			var cid int
 			var name, colType string
@@ -370,45 +398,57 @@ func getTableColumns(dbConn *sql.DB, dbType models.DBType, tableName string) []s
 			if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
 				continue
 			}
-			columns = append(columns, fmt.Sprintf("%s (%s)", name, colType))
+			columns = append(columns, ColumnInfo{Name: name, Type: colType})
 		}
 		return columns
 
 	case models.MySQL:
-		colQuery = fmt.Sprintf(`
-			SELECT column_name, data_type
+		colQuery := `
+			SELECT column_name, data_type, IFNULL(column_comment, '')
 			FROM information_schema.columns
-			WHERE table_name = '%s' AND table_schema = DATABASE()
-			ORDER BY ordinal_position`, tableName)
-	case models.PostgreSQL:
-		colQuery = fmt.Sprintf(`
-			SELECT column_name, data_type
-			FROM information_schema.columns
-			WHERE table_name = '%s'
-			ORDER BY ordinal_position`, tableName)
-	default:
-		return []string{}
-	}
-
-	if dbType == models.MySQL || dbType == models.PostgreSQL {
-		rows, err := dbConn.Query(colQuery)
+			WHERE table_name = ? AND table_schema = DATABASE()
+			ORDER BY ordinal_position`
+		rows, err := dbConn.Query(colQuery, tableName)
 		if err != nil {
-			return []string{}
+			return []ColumnInfo{}
 		}
 		defer rows.Close()
 
-		var columns []string
+		var columns []ColumnInfo
 		for rows.Next() {
-			var name, dataType string
-			if err := rows.Scan(&name, &dataType); err != nil {
+			var name, dataType, comment string
+			if err := rows.Scan(&name, &dataType, &comment); err != nil {
 				continue
 			}
-			columns = append(columns, fmt.Sprintf("%s (%s)", name, dataType))
+			columns = append(columns, ColumnInfo{Name: name, Type: dataType, Comment: comment})
+		}
+		return columns
+
+	case models.PostgreSQL:
+		colQuery := `
+			SELECT c.column_name, c.data_type, 
+			       COALESCE(pg_catalog.col_description(c.table_name::regclass::oid, c.ordinal_position), '')
+			FROM information_schema.columns c
+			WHERE c.table_name = $1
+			ORDER BY c.ordinal_position`
+		rows, err := dbConn.Query(colQuery, tableName)
+		if err != nil {
+			return []ColumnInfo{}
+		}
+		defer rows.Close()
+
+		var columns []ColumnInfo
+		for rows.Next() {
+			var name, dataType, comment string
+			if err := rows.Scan(&name, &dataType, &comment); err != nil {
+				continue
+			}
+			columns = append(columns, ColumnInfo{Name: name, Type: dataType, Comment: comment})
 		}
 		return columns
 	}
 
-	return []string{}
+	return []ColumnInfo{}
 }
 
 // GetTableColumns 获取指定表的列信息（列名和数据类型）。
@@ -471,7 +511,7 @@ func GetTableColumns(c *gin.Context) {
 
 	case models.MySQL, models.PostgreSQL:
 		colQuery = fmt.Sprintf(`
-			SELECT column_name, data_type, is_nullable, column_default
+			SELECT column_name, data_type, is_nullable, column_default, column_comment
 			FROM information_schema.columns
 			WHERE table_name = '%s'`, tableName)
 
@@ -491,19 +531,25 @@ func GetTableColumns(c *gin.Context) {
 			Type    string `json:"type"`
 			NotNull bool   `json:"notnull"`
 			PK      int    `json:"pk"`
+			Comment string `json:"comment"`
 		}
 
 		var columns []ColumnInfo
 		for rows.Next() {
 			var name, colType, nullable string
-			var defaultValue *string
-			if err := rows.Scan(&name, &colType, &nullable, &defaultValue); err != nil {
+			var defaultValue, comment *string
+			if err := rows.Scan(&name, &colType, &nullable, &defaultValue, &comment); err != nil {
 				continue
+			}
+			colComment := ""
+			if comment != nil {
+				colComment = *comment
 			}
 			columns = append(columns, ColumnInfo{
 				Name:    name,
 				Type:    colType,
 				NotNull: nullable == "NO",
+				Comment: colComment,
 			})
 		}
 
@@ -511,7 +557,7 @@ func GetTableColumns(c *gin.Context) {
 		return
 
 	default:
-		logError(c, http.StatusNotImplemented, "Not implemented for " + string(connInfo.Type))
+		logError(c, http.StatusNotImplemented, "Not implemented for "+string(connInfo.Type))
 		return
 	}
 }
@@ -542,9 +588,10 @@ func GetTableDDL(c *gin.Context) {
 		// SQLite 直接从 sqlite_master 表中读取 sql 字段
 		err = dbConn.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", tableName).Scan(&ddl)
 	case models.MySQL:
-		// MySQL 使用 SHOW CREATE TABLE
+		// MySQL 使用 SHOW CREATE TABLE，用反引号包裹表名防止注入
+		safeName := "`" + strings.ReplaceAll(tableName, "`", "``") + "`"
 		var dummy string
-		err = dbConn.QueryRow(fmt.Sprintf("SHOW CREATE TABLE %s", tableName)).Scan(&dummy, &ddl)
+		err = dbConn.QueryRow(fmt.Sprintf("SHOW CREATE TABLE %s", safeName)).Scan(&dummy, &ddl)
 	case models.PostgreSQL:
 		// Postgres 没有简单的 SHOW CREATE TABLE，这里我们通过查询元数据生成一个基础版本
 		// 生产环境下通常会使用更复杂的存储过程或工具函数
@@ -558,12 +605,12 @@ func GetTableDDL(c *gin.Context) {
 			GROUP BY table_name`
 		err = dbConn.QueryRow(query, tableName).Scan(&ddl)
 	default:
-		logError(c, http.StatusNotImplemented, "DDL view not implemented for " + string(connInfo.Type))
+		logError(c, http.StatusNotImplemented, "DDL view not implemented for "+string(connInfo.Type))
 		return
 	}
 
 	if err != nil {
-		logError(c, http.StatusInternalServerError, "Failed to fetch DDL: " + err.Error())
+		logError(c, http.StatusInternalServerError, "Failed to fetch DDL: "+err.Error())
 		return
 	}
 
@@ -593,7 +640,10 @@ func ExportCSV(c *gin.Context) {
 		return
 	}
 
-	rows, err := dbConn.Query(req.SQL)
+	ctx, cancel := context.WithTimeout(context.Background(), getQueryTimeout(req.Timeout))
+	defer cancel()
+
+	rows, err := dbConn.QueryContext(ctx, req.SQL)
 	if err != nil {
 		logError(c, http.StatusInternalServerError, err.Error())
 		return
@@ -672,7 +722,10 @@ func ExportJSON(c *gin.Context) {
 		return
 	}
 
-	rows, err := dbConn.Query(req.SQL)
+	ctx, cancel := context.WithTimeout(context.Background(), getQueryTimeout(req.Timeout))
+	defer cancel()
+
+	rows, err := dbConn.QueryContext(ctx, req.SQL)
 	if err != nil {
 		logError(c, http.StatusInternalServerError, err.Error())
 		return
@@ -752,7 +805,7 @@ func GetDatabases(c *gin.Context) {
 	case models.PostgreSQL:
 		dbQuery = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname"
 	default:
-		logError(c, http.StatusNotImplemented, "Not implemented for " + string(connInfo.Type))
+		logError(c, http.StatusNotImplemented, "Not implemented for "+string(connInfo.Type))
 		return
 	}
 
@@ -801,21 +854,21 @@ func HandleTransaction(c *gin.Context) {
 		// 开启新事务
 		_, err := db.Pool.BeginTx(connInfo, userId)
 		if err != nil {
-			logError(c, http.StatusInternalServerError, "Failed to begin transaction: " + err.Error())
+			logError(c, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Transaction started"})
 	case "commit":
 		// 提交当前事务
 		if err := db.Pool.CommitTx(connInfo.ID, userId); err != nil {
-			logError(c, http.StatusInternalServerError, "Failed to commit: " + err.Error())
+			logError(c, http.StatusInternalServerError, "Failed to commit: "+err.Error())
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Transaction committed"})
 	case "rollback":
 		// 回滚当前事务
 		if err := db.Pool.RollbackTx(connInfo.ID, userId); err != nil {
-			logError(c, http.StatusInternalServerError, "Failed to rollback: " + err.Error())
+			logError(c, http.StatusInternalServerError, "Failed to rollback: "+err.Error())
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Transaction rolled back"})
@@ -970,7 +1023,7 @@ func ExecuteNonQuery(c *gin.Context) {
 
 	execStmts := func() error {
 		hasActiveTx := db.Pool.GetTx(connInfo.ID, userId) != nil
-		ctx, cancel := context.WithTimeout(context.Background(), config.ExecTimeout())
+		ctx, cancel := context.WithTimeout(context.Background(), getExecTimeout(req.Timeout))
 		defer cancel()
 		for _, stmt := range statements {
 			var result sql.Result
@@ -1108,5 +1161,5 @@ func ExecuteRawQuery(c *gin.Context) {
 		return
 	}
 
-	executeQuery(c, dbConn, sqlQuery)
+	executeQuery(c, dbConn, sqlQuery, getQueryTimeout(req.Timeout))
 }

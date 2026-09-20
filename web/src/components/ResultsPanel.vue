@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { BarChart3, Download, Filter, LayoutGrid, Play, Clock, Hash } from 'lucide-vue-next'
 import { FileSpreadsheet } from 'lucide-vue-next'
 import ChartViewer from './ChartViewer.vue'
+
+const ROW_HEIGHT = 33
+const BUFFER = 15
 
 const props = defineProps<{
   results: any
@@ -24,10 +27,49 @@ defineEmits<{
 }>()
 
 const showColumnFilter = ref(false)
+const scrollContainer = ref<HTMLElement | null>(null)
+const scrollTop = ref(0)
+const containerHeight = ref(0)
 
 const hasResults = computed(() => props.results?.columns && props.sortedData.length > 0)
 const isDML = computed(() => props.results?.rowsAffected !== undefined && props.results?.rowsAffected !== null && !hasResults.value)
 const hasError = computed(() => !!props.results?.error)
+
+const totalHeight = computed(() => props.sortedData.length * ROW_HEIGHT)
+const startIndex = computed(() => Math.max(0, Math.floor(scrollTop.value / ROW_HEIGHT) - BUFFER))
+const endIndex = computed(() => Math.min(
+  props.sortedData.length,
+  Math.ceil((scrollTop.value + containerHeight.value) / ROW_HEIGHT) + BUFFER
+))
+const visibleRows = computed(() => props.sortedData.slice(startIndex.value, endIndex.value))
+const offsetY = computed(() => startIndex.value * ROW_HEIGHT)
+
+const handleScroll = () => {
+  if (scrollContainer.value) {
+    scrollTop.value = scrollContainer.value.scrollTop
+  }
+}
+
+const updateContainerHeight = () => {
+  if (scrollContainer.value) {
+    containerHeight.value = scrollContainer.value.clientHeight
+  }
+}
+
+onMounted(() => {
+  nextTick(updateContainerHeight)
+  window.addEventListener('resize', updateContainerHeight)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', updateContainerHeight)
+})
+
+// 数据变化时重置滚动位置
+watch(() => props.sortedData, () => {
+  scrollTop.value = 0
+  nextTick(updateContainerHeight)
+})
 </script>
 
 <template>
@@ -145,7 +187,7 @@ const hasError = computed(() => !!props.results?.error)
             {{ results.duration }}
           </span>
         </div>
-        <div class="flex-1 min-h-0 overflow-auto">
+        <div ref="scrollContainer" class="flex-1 min-h-0 overflow-auto" @scroll="handleScroll">
           <table v-if="resultViewTab === 'table'" class="w-full text-left border-separate border-spacing-0">
             <thead>
               <tr class="sticky top-0 z-10 bg-slate-900">
@@ -174,10 +216,16 @@ const hasError = computed(() => !!props.results?.error)
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(row, i) in sortedData" :key="i" class="border-b border-slate-800 hover:bg-slate-800/50 transition">
-                <td v-for="(cell, j) in row" :key="j" class="p-2 text-sm font-mono text-slate-300">
+              <tr style="height: 0">
+                <td :style="{ padding: 0, height: offsetY + 'px' }"></td>
+              </tr>
+              <tr v-for="(row, i) in visibleRows" :key="startIndex + i" class="border-b border-slate-800 hover:bg-slate-800/50 transition">
+                <td v-for="(cell, j) in row" :key="j" class="p-2 text-sm font-mono text-slate-300" :style="{ height: ROW_HEIGHT + 'px' }">
                   {{ cell }}
                 </td>
+              </tr>
+              <tr style="height: 0">
+                <td :style="{ padding: 0, height: (totalHeight - offsetY - visibleRows.length * ROW_HEIGHT) + 'px' }"></td>
               </tr>
             </tbody>
           </table>

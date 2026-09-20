@@ -5,7 +5,7 @@ import { Settings, X, Download, Upload } from 'lucide-vue-next'
 
 const props = defineProps<{
   show: boolean
-  settings: { limit: number }
+  settings: { limit: number; timeout: number }
   isAdmin: boolean
 }>()
 
@@ -76,6 +76,18 @@ const handleImportFile = async (event: Event) => {
           </div>
           <p class="mt-2 text-[10px] text-slate-500">
             Automatically appends LIMIT to SELECT queries if not specified.
+          </p>
+        </div>
+
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase mb-2">Query Timeout</label>
+          <div class="flex items-center gap-3">
+            <input v-model.number="settings.timeout" type="number" min="1" max="3600"
+                   class="flex-1 bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 focus:outline-none transition" />
+            <span class="text-xs text-slate-500 italic">seconds</span>
+          </div>
+          <p class="mt-2 text-[10px] text-slate-500">
+            Maximum execution time for a single query. Default: 300s (5 min).
           </p>
         </div>
 

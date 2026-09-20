@@ -76,19 +76,17 @@ func (tl *TableLocker) TryLock(tableName string) bool {
 	return tlck.mu.TryLock()
 }
 
-// LockWithTimeout 带超时的锁获取。返回是否成功获取。
+// LockWithTimeout 带超时的锁获取。使用 TryLock 轮询，避免 goroutine 泄漏。
 func (tl *TableLocker) LockWithTimeout(tableName string, timeout time.Duration) error {
-	done := make(chan struct{})
-	go func() {
-		tl.Lock(tableName)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("acquire lock timeout for table %s after %v", tableName, timeout)
+	deadline := time.Now().Add(timeout)
+	for {
+		if tl.TryLock(tableName) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("acquire lock timeout for table %s after %v", tableName, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

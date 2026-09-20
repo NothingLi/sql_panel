@@ -1,4 +1,5 @@
 import { onUnmounted, shallowRef, type Ref } from 'vue'
+import { getFunctions, CATEGORY_LABELS } from './sqlFunctions'
 
 const SQL_COMPLETION_KEYWORDS = [
   'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN', 'ON',
@@ -33,12 +34,17 @@ const SQL_COMPLETION_SNIPPETS = [
  * 这个 composable 专门负责 Monaco 这类“第三方编辑器集成”：
  * - 保存 editor 实例
  * - 注册 SQL 主题
- * - 注册 SQL 补全
+ * - 注册 SQL 补全（含按 dbType + version 过滤的函数智能提示）
  * - 注册 Ctrl/Cmd + Enter 快捷键
  *
- * App.vue 只需要把 schema 和 runQuery 传进来。
+ * App.vue 只需要把 schema、runQuery、dbType、dbVersion 传进来。
  */
-export function useSqlMonaco(schema: Ref<any[]>, runQuery: () => void) {
+export function useSqlMonaco(
+  schema: Ref<any[]>,
+  runQuery: () => void,
+  dbType: Ref<string>,
+  dbVersion: Ref<string>,
+) {
   const editorRef = shallowRef<any>()
   const MONACO_THEME = 'sql-dark'
   let completionProviderDisposable: any = null
@@ -102,7 +108,8 @@ export function useSqlMonaco(schema: Ref<any[]>, runQuery: () => void) {
     if (completionProviderDisposable) return
 
     completionProviderDisposable = monacoInstance.languages.registerCompletionItemProvider('sql', {
-      triggerCharacters: [' ', '.', ','],
+      // 加 '(' 作为函数补全触发字符
+      triggerCharacters: [' ', '.', ',', '('],
       provideCompletionItems: (model: any, position: any) => {
         const word = model.getWordUntilPosition(position)
         const range = {
@@ -137,22 +144,52 @@ export function useSqlMonaco(schema: Ref<any[]>, runQuery: () => void) {
         }))
 
         const columnSuggestions = schema.value.flatMap(table => {
-          return (table.columns || []).map((column: string) => {
-            const columnName = column.split(' (')[0]
+          return (table.columns || []).map((column: any) => {
+            // 兼容两种 schema 格式：对象 {name, type, comment} 或字符串 "col (TYPE)"
+            let columnName: string
+            let columnType = ''
+            let columnComment = ''
+            if (typeof column === 'string') {
+              // 从 "col (TYPE)" 中提取列名和类型
+              const match = column.match(/^(.+?)\s*\(([^)]+)\)$/)
+              columnName = match ? match[1].trim() : column
+              columnType = match ? match[2].trim().toUpperCase() : ''
+            } else {
+              columnName = column.name
+              columnType = (column.type || '').trim().toUpperCase()
+              columnComment = column.comment || ''
+            }
             return {
               label: `${columnName} (${table.name})`,
               kind: monacoInstance.languages.CompletionItemKind.Field,
               insertText: columnName,
-              detail: column,
+              // detail 保持简洁：只显示规范化后的类型，无类型时回退为 'column'
+              detail: columnType || 'column',
+              // 注释放到 documentation，选中时展开，并标注定位便于区分同名列
+              documentation: columnComment
+                ? `${columnComment}\n\n${table.name}.${columnName}`
+                : `列于 ${table.name}.${columnName}`,
               range,
             }
           })
         })
 
+        // 按 dbType + version 过滤的函数智能提示
+        const functionSuggestions = getFunctions(dbType.value, dbVersion.value).map(fn => ({
+          label: fn.name,
+          kind: monacoInstance.languages.CompletionItemKind.Function,
+          insertText: fn.insertText || fn.signature,
+          insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: `${CATEGORY_LABELS[fn.category] || fn.category} · ${fn.signature}`,
+          documentation: fn.description,
+          range,
+        }))
+
         return {
           suggestions: [
             ...snippetSuggestions,
             ...keywordSuggestions,
+            ...functionSuggestions,
             ...tableSuggestions,
             ...columnSuggestions,
           ]

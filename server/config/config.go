@@ -17,7 +17,7 @@ func JWTSecret() []byte {
 	return []byte("your_secret_key_sql_panel")
 }
 
-// QueryTimeout 返回 SELECT 查询超时时间，默认 30 秒。
+// QueryTimeout 返回 SELECT 查询超时时间，默认 300 秒（5 分钟）。
 // 可通过环境变量 QUERY_TIMEOUT_SEC 覆盖。
 func QueryTimeout() time.Duration {
 	if s := os.Getenv("QUERY_TIMEOUT_SEC"); s != "" {
@@ -25,10 +25,10 @@ func QueryTimeout() time.Duration {
 			return time.Duration(n) * time.Second
 		}
 	}
-	return 30 * time.Second
+	return 300 * time.Second
 }
 
-// ExecTimeout 返回 INSERT/UPDATE/DELETE/DDL 执行超时时间，默认 60 秒。
+// ExecTimeout 返回 INSERT/UPDATE/DELETE/DDL 执行超时时间，默认 300 秒（5 分钟）。
 // 可通过环境变量 EXEC_TIMEOUT_SEC 覆盖。
 func ExecTimeout() time.Duration {
 	if s := os.Getenv("EXEC_TIMEOUT_SEC"); s != "" {
@@ -36,7 +36,7 @@ func ExecTimeout() time.Duration {
 			return time.Duration(n) * time.Second
 		}
 	}
-	return 60 * time.Second
+	return 300 * time.Second
 }
 
 // DDLLockTimeout 返回等待 DDL 表级锁的超时时间，默认 60 秒。
